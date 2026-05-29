@@ -1,14 +1,9 @@
-// filterprotect.js
 require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
   Partials,
   EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  StringSelectMenuBuilder,
   PermissionsBitField,
   Events
 } = require("discord.js");
@@ -41,7 +36,9 @@ function ensureGuildConfig(guildId) {
   if (!config.guilds[guildId]) {
     config.guilds[guildId] = {
       adminRole: null,
-      harshness: 1,
+      logsChannelId: null,
+      harshness: 2,
+      setupOwnerId: null,
       modules: {
         textFilter: true,
         spamFilter: true,
@@ -55,8 +52,7 @@ function ensureGuildConfig(guildId) {
         groomingFilter: true,
         profanityFilter: true
       },
-      strikes: {},
-      logsChannelId: null
+      strikes: {}
     };
   }
   return config.guilds[guildId];
@@ -97,15 +93,7 @@ async function logEvent(guild, guildConfig, title, description, fields = []) {
   }
 }
 
-// ---------------- PERMISSIONS ----------------
-function canManage(interaction, guildConfig) {
-  if (interaction.user.id === interaction.guild.ownerId) return true;
-  if (!guildConfig.adminRole) return false;
-  return interaction.member.roles.cache.has(guildConfig.adminRole);
-}
-
 // ---------------- WORD LISTS ----------------
-// NSFW / sexual
 const NSFW_WORDS = [
   "sex","porn","porno","pornhub","nude","nudes","naked","blowjob","bj","pussy","cock","dick","dildo",
   "anal","deepthroat","hentai","cum","cumshot","orgasm","tits","boobs","milf","fetish","bdsm","bondage",
@@ -113,51 +101,43 @@ const NSFW_WORDS = [
   "masturbation","handjob","69","threesome","foursome","gangbang","creampie","facial","rimjob"
 ];
 
-// profanity / insults
 const PROFANITY = [
   "fuck","shit","bitch","whore","slut","bastard","cunt","dickhead","motherfucker","asshole","prick",
   "twat","wanker","bollocks","piss off","go fuck yourself","son of a bitch"
 ];
 
-// violence / gore
 const VIOLENCE = [
   "kill","murder","stab","shoot","blood","gore","die","choke","strangled","decapitate","torture",
   "execute","assault","beat you","i will kill you","i will hurt you","i will stab you","i will shoot you"
 ];
 
-// self-harm / suicide
 const SELF_HARM = [
   "kys","kill yourself","go die","end yourself","suicide","self harm","cut myself","i want to die",
   "i want to kill myself","i want to end it","i hate my life"
 ];
 
-// drugs
 const DRUGS = [
   "weed","cannabis","marijuana","coke","cocaine","heroin","meth","methamphetamine","pills","xanax",
   "ketamine","lsd","acid","molly","ecstasy","crack","opioids","opium","lean","codeine"
 ];
 
-// gambling
 const GAMBLING = [
   "casino","slots","betting","roulette","blackjack","jackpot","poker","sportsbook","bet","wager",
   "stake","gamble","slot machine"
 ];
 
-// scams / phishing
 const SCAMS = [
   "free nitro","nitro generator","click here","verify your account","steam gift","crypto giveaway",
   "airdrop","investment bot","double your money","free robux","free vbucks","claim reward",
   "login to claim","you won","winner selected","congratulations click"
 ];
 
-// grooming / predatory
 const GROOMING = [
   "send pics","send nudes","dont tell anyone","dont tell your parents","how old are you really",
   "are you alone","show me","private chat","secret chat","i can teach you","trust me only",
   "come meet me","dont tell your friends"
 ];
 
-// bypass variants
 const LEET_VARIANTS = [
   "f4ck","f@ck","f*ck","f!ck",
   "sh1t","sh!t","5hit",
@@ -208,6 +188,437 @@ const TEXT_FILTER = [
 // spam map
 const spamMap = {};
 
+// ---------------- SETUP / SETTINGS SESSIONS ----------------
+const setupSessions = {};   // userId -> { guildId, step, temp }
+const settingsSessions = {}; // userId -> { guildId, step, temp }
+
+// ---------------- READY ----------------
+client.once(Events.ClientReady, () => {
+  console.log(`Logged in as ${client.user.tag}`);
+});
+
+// ---------------- COMMANDS ----------------
+client.on(Events.ClientReady, async () => {
+  const commands = [
+    {
+      name: "setup",
+      description: "Initial FilterProtect setup (owner / installer only)"
+    },
+    {
+      name: "settings",
+      description: "Change FilterProtect settings (admin role only)"
+    }
+  ];
+  await client.application.commands.set(commands);
+});
+
+// ---------------- PERMISSION HELPERS ----------------
+function isOwnerOrSetupUser(interaction, guildConfig) {
+  if (interaction.user.id === interaction.guild.ownerId) return true;
+  if (guildConfig.setupOwnerId && guildConfig.setupOwnerId === interaction.user.id) return true;
+  return false;
+}
+
+function isAdminRole(interaction, guildConfig) {
+  if (!guildConfig.adminRole) return false;
+  return interaction.member.roles.cache.has(guildConfig.adminRole);
+}
+
+// ---------------- INTERACTIONS ----------------
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.inGuild()) return;
+
+  const guildId = interaction.guild.id;
+  const guildConfig = ensureGuildConfig(guildId);
+
+  if (interaction.commandName === "setup") {
+    if (!isOwnerOrSetupUser(interaction, guildConfig)) {
+      return interaction.reply({
+        content: "❌ Only the **server owner** or the **original setup user** can run `/setup`.",
+        ephemeral: true
+      });
+    }
+
+    setupSessions[interaction.user.id] = {
+      guildId,
+      step: 1,
+      temp: {
+        adminRoleId: null,
+        logsChannelId: null,
+        harshness: 2
+      }
+    };
+
+    await interaction.reply({
+      content: "📩 Check your DMs — starting FilterProtect setup.",
+      ephemeral: true
+    });
+
+    try {
+      const dm = await interaction.user.createDM();
+      await dm.send(
+        `🛡️ **FilterProtect Setup — Step 1/3**\n\n` +
+        `Please mention the **admin role** (e.g. @Staff) or send its ID.\n` +
+        `This role will be allowed to use moderation commands and /settings.\n\n` +
+        `Type \`cancel\` to stop.`
+      );
+    } catch {
+      return interaction.followUp({
+        content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
+        ephemeral: true
+      });
+    }
+
+    return;
+  }
+
+  if (interaction.commandName === "settings") {
+    if (!isAdminRole(interaction, guildConfig)) {
+      return interaction.reply({
+        content: "❌ Only members with the configured **admin role** can use `/settings`.",
+        ephemeral: true
+      });
+    }
+
+    settingsSessions[interaction.user.id] = {
+      guildId,
+      step: 1,
+      temp: {
+        harshness: guildConfig.harshness,
+        modules: { ...guildConfig.modules },
+        logsChannelId: guildConfig.logsChannelId
+      }
+    };
+
+    await interaction.reply({
+      content: "📩 Check your DMs — opening FilterProtect settings.",
+      ephemeral: true
+    });
+
+    try {
+      const dm = await interaction.user.createDM();
+      await dm.send(
+        `🛡️ **FilterProtect Settings — Step 1/3**\n\n` +
+        `Current harshness: **${guildConfig.harshness}**\n` +
+        `Send a number **1–4** to change it:\n` +
+        `1 = Soft (delete + warn)\n` +
+        `2 = Medium (delete + warn + strike)\n` +
+        `3 = Hard (delete + timeout)\n` +
+        `4 = Extreme (delete + timeout + auto‑kick at 3 strikes)\n\n` +
+        `Or type \`skip\` to keep it.\n` +
+        `Type \`cancel\` to stop.`
+      );
+    } catch {
+      return interaction.followUp({
+        content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
+        ephemeral: true
+      });
+    }
+
+    return;
+  }
+});
+
+// ---------------- DM WIZARD HANDLING ----------------
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (message.guild) return; // only DMs here
+
+  const userId = message.author.id;
+  const content = message.content.trim();
+
+  // SETUP WIZARD
+  if (setupSessions[userId]) {
+    const session = setupSessions[userId];
+    const guild = client.guilds.cache.get(session.guildId);
+    if (!guild) {
+      delete setupSessions[userId];
+      return message.channel.send("❌ Guild not found. Setup cancelled.");
+    }
+    const guildConfig = ensureGuildConfig(guild.id);
+
+    if (content.toLowerCase() === "cancel") {
+      delete setupSessions[userId];
+      return message.channel.send("❌ Setup cancelled.");
+    }
+
+    // STEP 1: admin role
+    if (session.step === 1) {
+      let roleId = null;
+
+      const mention = content.match(/^<@&(\d+)>$/);
+      if (mention) roleId = mention[1];
+      else if (/^\d+$/.test(content)) roleId = content;
+
+      const role = roleId ? guild.roles.cache.get(roleId) : null;
+      if (!role) {
+        return message.channel.send(
+          "❌ I couldn't find that role in the server.\n" +
+          "Please mention the role (e.g. @Staff) or send its ID."
+        );
+      }
+
+      session.temp.adminRoleId = role.id;
+      session.step = 2;
+      setupSessions[userId] = session;
+
+      return message.channel.send(
+        `✅ Admin role set to **${role.name}**.\n\n` +
+        `🛡️ **Step 2/3 — Logs Channel**\n` +
+        `Please mention the **logs channel** (e.g. #filterprotect-logs), or type \`auto\` to let me create one.\n` +
+        `Type \`cancel\` to stop.`
+      );
+    }
+
+    // STEP 2: logs channel
+    if (session.step === 2) {
+      let logsChannelId = null;
+
+      if (content.toLowerCase() === "auto") {
+        logsChannelId = null; // will auto-create
+      } else {
+        const mention = content.match(/^<#(\d+)>$/);
+        if (mention) logsChannelId = mention[1];
+        else if (/^\d+$/.test(content)) logsChannelId = content;
+
+        const ch = logsChannelId ? guild.channels.cache.get(logsChannelId) : null;
+        if (!ch || !ch.isTextBased()) {
+          return message.channel.send(
+            "❌ I couldn't find that text channel in the server.\n" +
+            "Please mention the channel (e.g. #logs) or type `auto`."
+          );
+        }
+      }
+
+      session.temp.logsChannelId = logsChannelId;
+      session.step = 3;
+      setupSessions[userId] = session;
+
+      return message.channel.send(
+        `✅ Logs channel ${logsChannelId ? `set to <#${logsChannelId}>` : "will be auto‑created."}\n\n` +
+        `🛡️ **Step 3/3 — Harshness**\n` +
+        `Send a number **1–4**:\n` +
+        `1 = Soft (delete + warn)\n` +
+        `2 = Medium (delete + warn + strike)\n` +
+        `3 = Hard (delete + timeout)\n` +
+        `4 = Extreme (delete + timeout + auto‑kick at 3 strikes)\n\n` +
+        `Type \`cancel\` to stop.`
+      );
+    }
+
+    // STEP 3: harshness + save
+    if (session.step === 3) {
+      const n = Number(content);
+      if (![1, 2, 3, 4].includes(n)) {
+        return message.channel.send("❌ Please send a number between **1** and **4**.");
+      }
+
+      session.temp.harshness = n;
+
+      // APPLY CONFIG
+      guildConfig.adminRole = session.temp.adminRoleId;
+      guildConfig.harshness = session.temp.harshness;
+      guildConfig.setupOwnerId = userId;
+
+      if (session.temp.logsChannelId) {
+        guildConfig.logsChannelId = session.temp.logsChannelId;
+      } else {
+        // auto-create logs channel
+        try {
+          const ch = await guild.channels.create({
+            name: "filterprotect-logs",
+            type: 0
+          });
+          guildConfig.logsChannelId = ch.id;
+        } catch (e) {
+          console.error("Auto logs create error:", e);
+        }
+      }
+
+      saveConfig();
+      delete setupSessions[userId];
+
+      await message.channel.send(
+        `✅ **FilterProtect setup complete for \`${guild.name}\`.**\n\n` +
+        `Admin role: <@&${guildConfig.adminRole}>\n` +
+        `Logs channel: ${guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not set"}\n` +
+        `Harshness: **${guildConfig.harshness}**\n\n` +
+        `You can now use \`/settings\` (admin role only) to tweak modules.`
+      );
+
+      await logEvent(
+        guild,
+        guildConfig,
+        "✅ FilterProtect Setup Complete",
+        `Setup completed via DM by ${message.author.tag}.`
+      );
+
+      return;
+    }
+
+    return;
+  }
+
+  // SETTINGS WIZARD
+  if (settingsSessions[userId]) {
+    const session = settingsSessions[userId];
+    const guild = client.guilds.cache.get(session.guildId);
+    if (!guild) {
+      delete settingsSessions[userId];
+      return message.channel.send("❌ Guild not found. Settings cancelled.");
+    }
+    const guildConfig = ensureGuildConfig(guild.id);
+
+    if (content.toLowerCase() === "cancel") {
+      delete settingsSessions[userId];
+      return message.channel.send("❌ Settings cancelled.");
+    }
+
+    // STEP 1: harshness
+    if (session.step === 1) {
+      if (content.toLowerCase() !== "skip") {
+        const n = Number(content);
+        if (![1, 2, 3, 4].includes(n)) {
+          return message.channel.send("❌ Please send a number between **1** and **4**, or `skip`.");
+        }
+        session.temp.harshness = n;
+      }
+
+      session.step = 2;
+      settingsSessions[userId] = session;
+
+      return message.channel.send(
+        `🛡️ **Settings — Step 2/3 (Modules)**\n\n` +
+        `Current modules:\n` +
+        `Text Filter: ${guildConfig.modules.textFilter ? "ON" : "OFF"}\n` +
+        `Spam Filter: ${guildConfig.modules.spamFilter ? "ON" : "OFF"}\n` +
+        `Link Filter: ${guildConfig.modules.linkFilter ? "ON" : "OFF"}\n` +
+        `Invite Filter: ${guildConfig.modules.inviteFilter ? "ON" : "OFF"}\n` +
+        `Gambling Filter: ${guildConfig.modules.gamblingFilter ? "ON" : "OFF"}\n` +
+        `Drugs Filter: ${guildConfig.modules.drugsFilter ? "ON" : "OFF"}\n` +
+        `Violence Filter: ${guildConfig.modules.violenceFilter ? "ON" : "OFF"}\n` +
+        `Self‑harm Filter: ${guildConfig.modules.selfharmFilter ? "ON" : "OFF"}\n` +
+        `Scam Filter: ${guildConfig.modules.scamFilter ? "ON" : "OFF"}\n` +
+        `Grooming Filter: ${guildConfig.modules.groomingFilter ? "ON" : "OFF"}\n` +
+        `Profanity Filter: ${guildConfig.modules.profanityFilter ? "ON" : "OFF"}\n\n` +
+        `Send a comma‑separated list of modules to **toggle**, e.g.:\n` +
+        `\`text, spam, links, profanity\`\n` +
+        `Available keys: text, spam, links, invites, gambling, drugs, violence, selfharm, scams, grooming, profanity\n\n` +
+        `Or type \`skip\` to keep them as they are.\n` +
+        `Type \`cancel\` to stop.`
+      );
+    }
+
+    // STEP 2: modules
+    if (session.step === 2) {
+      if (content.toLowerCase() !== "skip") {
+        const keys = content
+          .toLowerCase()
+          .split(",")
+          .map(x => x.trim())
+          .filter(Boolean);
+
+        const map = {
+          text: "textFilter",
+          spam: "spamFilter",
+          links: "linkFilter",
+          invites: "inviteFilter",
+          gambling: "gamblingFilter",
+          drugs: "drugsFilter",
+          violence: "violenceFilter",
+          selfharm: "selfharmFilter",
+          scams: "scamFilter",
+          grooming: "groomingFilter",
+          profanity: "profanityFilter"
+        };
+
+        for (const k of keys) {
+          const internal = map[k];
+          if (internal && Object.prototype.hasOwnProperty.call(guildConfig.modules, internal)) {
+            session.temp.modules[internal] = !session.temp.modules[internal];
+          }
+        }
+      }
+
+      session.step = 3;
+      settingsSessions[userId] = session;
+
+      return message.channel.send(
+        `🛡️ **Settings — Step 3/3 (Logs Channel)**\n\n` +
+        `Current logs channel: ${guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not set / auto"}\n\n` +
+        `Mention a new logs channel (e.g. #logs), or type \`auto\` to let me create one if missing.\n` +
+        `Or type \`skip\` to keep it.\n` +
+        `Type \`cancel\` to stop.`
+      );
+    }
+
+    // STEP 3: logs + save
+    if (session.step === 3) {
+      let logsChannelId = guildConfig.logsChannelId;
+
+      if (content.toLowerCase() !== "skip") {
+        if (content.toLowerCase() === "auto") {
+          logsChannelId = null;
+        } else {
+          const mention = content.match(/^<#(\d+)>$/);
+          if (mention) logsChannelId = mention[1];
+          else if (/^\d+$/.test(content)) logsChannelId = content;
+
+          if (logsChannelId) {
+            const ch = guild.channels.cache.get(logsChannelId);
+            if (!ch || !ch.isTextBased()) {
+              return message.channel.send(
+                "❌ I couldn't find that text channel in the server.\n" +
+                "Please mention the channel, send its ID, `auto`, or `skip`."
+              );
+            }
+          }
+        }
+      }
+
+      // APPLY
+      guildConfig.harshness = session.temp.harshness;
+      guildConfig.modules = session.temp.modules;
+
+      if (logsChannelId) {
+        guildConfig.logsChannelId = logsChannelId;
+      } else {
+        try {
+          const ch = await guild.channels.create({
+            name: "filterprotect-logs",
+            type: 0
+          });
+          guildConfig.logsChannelId = ch.id;
+        } catch (e) {
+          console.error("Auto logs create error:", e);
+        }
+      }
+
+      saveConfig();
+      delete settingsSessions[userId];
+
+      await message.channel.send(
+        `✅ **FilterProtect settings updated for \`${guild.name}\`.**\n\n` +
+        `Harshness: **${guildConfig.harshness}**\n` +
+        `Logs channel: ${guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not set"}\n` +
+        `Modules updated.`
+      );
+
+      await logEvent(
+        guild,
+        guildConfig,
+        "⚙️ FilterProtect Settings Updated",
+        `Settings updated via DM by ${message.author.tag}.`
+      );
+
+      return;
+    }
+
+    return;
+  }
+});
+
 // ---------------- GUILD JOIN ----------------
 client.on(Events.GuildCreate, async (guild) => {
   ensureGuildConfig(guild.id);
@@ -220,262 +631,12 @@ client.on(Events.GuildCreate, async (guild) => {
     .setTitle("👋 Welcome to FilterProtect")
     .setDescription(
       "Thanks for adding **FilterProtect**.\n\n" +
-      "Use `/filterprotect panel` to configure the bot.\n\n" +
-      "Only the **server owner** or the chosen **admin role** can manage settings."
+      "Use `/setup` (server owner) to configure the bot.\n" +
+      "After setup, admins can use `/settings` via DMs."
     )
     .setColor("#5865F2");
 
   await channel.send({ embeds: [embed] });
-});
-
-// ---------------- SLASH COMMANDS ----------------
-client.on("ready", async () => {
-  const commands = [
-    {
-      name: "filterprotect",
-      description: "FilterProtect controls",
-      options: [
-        {
-          name: "panel",
-          description: "Open the FilterProtect control panel",
-          type: 1
-        }
-      ]
-    }
-  ];
-
-  await client.application.commands.set(commands);
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-// ---------------- INTERACTIONS ----------------
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.inGuild()) return;
-  const guildId = interaction.guild.id;
-  const guildConfig = ensureGuildConfig(guildId);
-
-  // slash command
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "filterprotect" && interaction.options.getSubcommand() === "panel") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({
-          content: "❌ You do not have permission to manage FilterProtect.",
-          ephemeral: true
-        });
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle("🛡️ FilterProtect Control Panel")
-        .setDescription(
-          "Use the buttons below to manage FilterProtect.\n\n" +
-          "**Page 1:** Admin + Logs\n" +
-          "**Page 2:** Modules\n" +
-          "**Page 3:** Harshness\n" +
-          "**Page 4:** Finish / Save"
-        )
-        .setColor("#5865F2");
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("fp_page1").setLabel("Page 1").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_page2").setLabel("Page 2").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_page3").setLabel("Page 3").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_page4").setLabel("Finish").setStyle(ButtonStyle.Success)
-      );
-
-      return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-    }
-  }
-
-  // buttons
-  if (interaction.isButton()) {
-    const id = interaction.customId;
-
-    // page 1: admin + logs
-    if (id === "fp_page1") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle("⚙️ Setup — Page 1 (Admin & Logs)")
-        .setDescription("Select an admin role and configure the logs channel.")
-        .setColor("#5865F2")
-        .addFields(
-          { name: "Admin Role", value: guildConfig.adminRole ? `<@&${guildConfig.adminRole}>` : "Not set", inline: true },
-          { name: "Logs Channel", value: guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Auto / Not set", inline: true }
-        );
-
-      const roles = interaction.guild.roles.cache
-        .filter(r => r.name !== "@everyone")
-        .map(r => ({ label: r.name.slice(0, 100), value: r.id }));
-
-      const roleMenu = new StringSelectMenuBuilder()
-        .setCustomId("fp_admin_role_select")
-        .setPlaceholder("Select admin role")
-        .addOptions(roles.slice(0, 25));
-
-      const logsButton = new ButtonBuilder()
-        .setCustomId("fp_set_logs_here")
-        .setLabel("Set this channel as logs")
-        .setStyle(ButtonStyle.Primary);
-
-      const row1 = new ActionRowBuilder().addComponents(roleMenu);
-      const row2 = new ActionRowBuilder().addComponents(logsButton);
-
-      return interaction.update({ embeds: [embed], components: [row1, row2] });
-    }
-
-    // page 2: modules
-    if (id === "fp_page2") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-
-      const m = guildConfig.modules;
-      const embed = new EmbedBuilder()
-        .setTitle("⚙️ Setup — Page 2 (Modules)")
-        .setDescription("Toggle modules on or off.")
-        .setColor("#5865F2")
-        .addFields(
-          { name: "Text Filter", value: m.textFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Spam Filter", value: m.spamFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Link Filter", value: m.linkFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Invite Filter", value: m.inviteFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Gambling Filter", value: m.gamblingFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Drugs Filter", value: m.drugsFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Violence Filter", value: m.violenceFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Self‑harm Filter", value: m.selfharmFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Scam Filter", value: m.scamFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Grooming Filter", value: m.groomingFilter ? "✅ ON" : "❌ OFF", inline: true },
-          { name: "Profanity Filter", value: m.profanityFilter ? "✅ ON" : "❌ OFF", inline: true }
-        );
-
-      const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("fp_toggle_text").setLabel("Text").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("fp_toggle_spam").setLabel("Spam").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("fp_toggle_links").setLabel("Links").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("fp_toggle_invites").setLabel("Invites").setStyle(ButtonStyle.Primary)
-      );
-
-      const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("fp_toggle_gambling").setLabel("Gambling").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_drugs").setLabel("Drugs").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_violence").setLabel("Violence").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_selfharm").setLabel("Self‑harm").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_scams").setLabel("Scams").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_grooming").setLabel("Grooming").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_toggle_profanity").setLabel("Profanity").setStyle(ButtonStyle.Secondary)
-      );
-
-      return interaction.update({ embeds: [embed], components: [row1, row2] });
-    }
-
-    // page 3: harshness
-    if (id === "fp_page3") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-
-      const embed = new EmbedBuilder()
-        .setTitle("⚙️ Setup — Page 3 (Harshness)")
-        .setDescription(
-          "Choose how strict FilterProtect should be:\n\n" +
-          "**1 Soft** — delete + warn\n" +
-          "**2 Medium** — delete + warn + strike\n" +
-          "**3 Hard** — delete + timeout\n" +
-          "**4 Extreme** — delete + timeout + auto‑kick after 3 strikes"
-        )
-        .setColor("#5865F2")
-        .addFields({ name: "Current", value: guildConfig.harshness.toString(), inline: true });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("fp_h1").setLabel("1").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_h2").setLabel("2").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_h3").setLabel("3").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("fp_h4").setLabel("4").setStyle(ButtonStyle.Danger)
-      );
-
-      return interaction.update({ embeds: [embed], components: [row] });
-    }
-
-    // page 4: finish
-    if (id === "fp_page4") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-
-      saveConfig();
-
-      const embed = new EmbedBuilder()
-        .setTitle("✅ Setup Complete")
-        .setDescription("FilterProtect is now active with your chosen settings.")
-        .setColor("#57F287");
-
-      return interaction.update({ embeds: [embed], components: [] });
-    }
-
-    // set logs here
-    if (id === "fp_set_logs_here") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-      guildConfig.logsChannelId = interaction.channel.id;
-      saveConfig();
-      return interaction.reply({ content: `✅ Logs channel set to <#${interaction.channel.id}>`, ephemeral: true });
-    }
-
-    // module toggles
-    const toggleMap = {
-      fp_toggle_text: "textFilter",
-      fp_toggle_spam: "spamFilter",
-      fp_toggle_links: "linkFilter",
-      fp_toggle_invites: "inviteFilter",
-      fp_toggle_gambling: "gamblingFilter",
-      fp_toggle_drugs: "drugsFilter",
-      fp_toggle_violence: "violenceFilter",
-      fp_toggle_selfharm: "selfharmFilter",
-      fp_toggle_scams: "scamFilter",
-      fp_toggle_grooming: "groomingFilter",
-      fp_toggle_profanity: "profanityFilter"
-    };
-
-    if (toggleMap[id]) {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-      const key = toggleMap[id];
-      guildConfig.modules[key] = !guildConfig.modules[key];
-      saveConfig();
-      return interaction.reply({
-        content: `🔧 **${key}** is now **${guildConfig.modules[key] ? "ENABLED" : "DISABLED"}**`,
-        ephemeral: true
-      });
-    }
-
-    // harshness buttons
-    if (id.startsWith("fp_h")) {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-      const level = Number(id.replace("fp_h", ""));
-      guildConfig.harshness = level;
-      saveConfig();
-      return interaction.reply({ content: `⚠️ Harshness set to **${level}**`, ephemeral: true });
-    }
-  }
-
-  // select menus
-  if (interaction.isStringSelectMenu()) {
-    if (interaction.customId === "fp_admin_role_select") {
-      if (!canManage(interaction, guildConfig)) {
-        return interaction.reply({ content: "❌ You cannot manage FilterProtect.", ephemeral: true });
-      }
-      const roleId = interaction.values[0];
-      guildConfig.adminRole = roleId;
-      saveConfig();
-      return interaction.reply({ content: `✅ Admin role set to <@&${roleId}>`, ephemeral: true });
-    }
-  }
 });
 
 // ---------------- MESSAGE FILTERING ----------------
@@ -541,26 +702,27 @@ client.on("messageCreate", async (message) => {
       const wNorm = word.toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9]/g, "");
       if (!wNorm) continue;
       if (normalized.includes(wNorm)) {
-        // category checks
-        if (NSFW_WORDS.includes(word) ||
-            PROFANITY.includes(word) && modules.profanityFilter ||
-            VIOLENCE.includes(word) && modules.violenceFilter ||
-            SELF_HARM.includes(word) && modules.selfharmFilter ||
-            DRUGS.includes(word) && modules.drugsFilter ||
-            GAMBLING.includes(word) && modules.gamblingFilter ||
-            SCAMS.includes(word) && modules.scamFilter ||
-            GROOMING.includes(word) && modules.groomingFilter ||
-            LEET_VARIANTS.includes(word) ||
-            BROKEN_WORDS.includes(word) ||
-            SYMBOL_VARIANTS.includes(word) ||
-            SHORTENED.includes(word)) {
+        if (
+          NSFW_WORDS.includes(word) ||
+          (PROFANITY.includes(word) && modules.profanityFilter) ||
+          (VIOLENCE.includes(word) && modules.violenceFilter) ||
+          (SELF_HARM.includes(word) && modules.selfharmFilter) ||
+          (DRUGS.includes(word) && modules.drugsFilter) ||
+          (GAMBLING.includes(word) && modules.gamblingFilter) ||
+          (SCAMS.includes(word) && modules.scamFilter) ||
+          (GROOMING.includes(word) && modules.groomingFilter) ||
+          LEET_VARIANTS.includes(word) ||
+          BROKEN_WORDS.includes(word) ||
+          SYMBOL_VARIANTS.includes(word) ||
+          SHORTENED.includes(word)
+        ) {
           return punish("Inappropriate text detected.");
         }
       }
     }
   }
 
-  // LINK FILTER
+  // LINK / INVITE FILTER
   if (modules.linkFilter || modules.inviteFilter) {
     const linkRegex = /(https?:\/\/[^\s]+)/gi;
     if (linkRegex.test(lower)) {
@@ -573,7 +735,7 @@ client.on("messageCreate", async (message) => {
     }
   }
 
-  // SPAM FILTER (advanced)
+  // SPAM FILTER
   if (modules.spamFilter) {
     const now = Date.now();
     const key = `${guildId}-${message.author.id}`;
