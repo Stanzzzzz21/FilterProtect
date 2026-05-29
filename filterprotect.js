@@ -6,10 +6,8 @@ const PORT = process.env.PORT || 3000;
 app.get("/", (req, res) => res.send("FilterProtect is running."));
 app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
 
-// --- Discord bot code starts below ---
+// --- Discord Bot Imports ---
 require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
-
 const {
   Client,
   GatewayIntentBits,
@@ -20,6 +18,7 @@ const {
   MessageFlags
 } = require("discord.js");
 const fs = require("fs");
+
 
 
 const client = new Client({
