@@ -1,4 +1,3 @@
-
 // --- Render Port Fix ---
 const express = require("express");
 const app = express();
@@ -11,7 +10,6 @@ app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
 require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 
-require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
