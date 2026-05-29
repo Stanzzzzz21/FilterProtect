@@ -5,7 +5,8 @@ const {
   Partials,
   EmbedBuilder,
   PermissionsBitField,
-  Events
+  Events,
+  MessageFlags
 } = require("discord.js");
 const fs = require("fs");
 
@@ -236,7 +237,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!isOwnerOrSetupUser(interaction, guildConfig)) {
       return interaction.reply({
         content: "❌ Only the **server owner** or the **original setup user** can run `/setup`.",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
@@ -252,7 +253,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.reply({
       content: "📩 Check your DMs — starting FilterProtect setup.",
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
 
     try {
@@ -266,7 +267,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {
       return interaction.followUp({
         content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
@@ -277,7 +278,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!isAdminRole(interaction, guildConfig)) {
       return interaction.reply({
         content: "❌ Only members with the configured **admin role** can use `/settings`.",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
@@ -293,7 +294,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.reply({
       content: "📩 Check your DMs — opening FilterProtect settings.",
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
 
     try {
@@ -312,7 +313,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {
       return interaction.followUp({
         content: "❌ I couldn't DM you. Please enable DMs from server members and try again.",
-        ephemeral: true
+        flags: MessageFlags.Ephemeral
       });
     }
 
