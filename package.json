@@ -1,7 +1,7 @@
 {
   "name": "filterprotect",
-  "version": "1.0.0",
-  "description": "FilterProtect Discord Bot",
+  "version": "2.0.0",
+  "description": "FilterProtect Discord Bot (Gemini Moderation)",
   "main": "filterprotect.js",
   "scripts": {
     "start": "node filterprotect.js"
