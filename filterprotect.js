@@ -1,12 +1,12 @@
-// --- Render Port Fix ---
+// ---------- Render Port Fix ----------
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => res.send("FilterProtect is running."));
+app.get("/", (_req, res) => res.send("FilterProtect is running."));
 app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
 
-// --- Discord Bot + Gemini ---
+// ---------- Imports ----------
 require("dotenv").config();
 const {
   Client,
@@ -21,10 +21,10 @@ const {
 } = require("discord.js");
 const fs = require("fs");
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set this in Render
-
-// ---------- CONFIG ----------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // set in Render
 const CONFIG_FILE = "./filterprotect_config.json";
+
+// ---------- Config ----------
 let config = { guilds: {} };
 
 if (fs.existsSync(CONFIG_FILE)) {
@@ -51,7 +51,7 @@ function ensureGuildConfig(guildId) {
   return config.guilds[guildId];
 }
 
-// ---------- CLIENT ----------
+// ---------- Client ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -62,62 +62,13 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
 });
 
-// ---------- GEMINI MODERATION ----------
-async function geminiModerate(text, urls = []) {
-  if (!GEMINI_API_KEY) return { unsafe: false, reason: "No API key" };
-
-  const prompt = `
-You are a strict moderation model. Classify if this content should be blocked in a Discord server.
-
-Content text:
-${text || "[no text]"}
-
-Attached URLs (may be images, videos, links):
-${urls.join("\n") || "[none]"}
-
-Return ONLY a short JSON object like:
-{"unsafe": true, "reason": "sexual content"} or {"unsafe": false, "reason": "clean"}
-`;
-
-  try {
-    const res = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
-        GEMINI_API_KEY,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }]
-            }
-          ]
-        })
-      }
-    );
-
-    const data = await res.json();
-    const textResp =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text || '{"unsafe":false,"reason":"no response"}';
-
-    let parsed;
-    try {
-      parsed = JSON.parse(textResp);
-    } catch {
-      parsed = { unsafe: false, reason: "parse error: " + textResp.slice(0, 100) };
-    }
-    return {
-      unsafe: !!parsed.unsafe,
-      reason: parsed.reason || "no reason"
-    };
-  } catch (e) {
-    console.error("Gemini error:", e);
-    return { unsafe: false, reason: "Gemini error" };
-  }
+// ---------- Utils ----------
+function isOwnerOrAdmin(member) {
+  if (!member || !member.guild) return false;
+  if (member.id === member.guild.ownerId) return true;
+  return member.permissions.has(PermissionsBitField.Flags.Administrator);
 }
 
-// ---------- LOGGING ----------
 async function logEvent(guild, guildConfig, title, description, fields = []) {
   try {
     let channel = guildConfig.logsChannelId
@@ -152,26 +103,116 @@ async function logEvent(guild, guildConfig, title, description, fields = []) {
   }
 }
 
-// ---------- SETUP SESSIONS (BUTTON-BASED) ----------
-const setupSessions = new Map(); // key: userId, value: { guildId, step, harshness, createAdmin, createLogs }
+// ---------- Gemini Moderation ----------
+async function geminiModerate(text, urls = []) {
+  if (!GEMINI_API_KEY) {
+    console.warn("No GEMINI_API_KEY set.");
+    return { unsafe: false, reason: "No API key" };
+  }
 
-function isOwnerOrAdmin(member) {
-  if (!member || !member.guild) return false;
-  if (member.id === member.guild.ownerId) return true;
-  return member.permissions.has(PermissionsBitField.Flags.Administrator);
+  const prompt = `
+You are an advanced moderation AI for a Discord server.
+
+Analyze the following message and attached URLs (which may be images, videos, or external links).
+
+Classify for:
+- sexual content (including minors, grooming)
+- nudity
+- violence / gore
+- hate / harassment / slurs
+- self-harm / suicide
+- extremism / terrorism
+- scams / fraud / malware
+- drugs / weapons
+- highly explicit memes or content
+
+Return ONLY a compact JSON object like:
+{
+  "unsafe": true,
+  "severity": 1-4,
+  "categories": ["sexual", "violence"],
+  "reason": "short human-readable summary"
 }
+
+Where:
+- unsafe = true if the message should be blocked
+- severity:
+  1 = mild (warning)
+  2 = medium (strike)
+  3 = high (timeout)
+  4 = extreme (kick/ban level)
+- categories = list of tags
+- reason = short explanation
+
+Message text:
+${text || "[no text]"}
+
+Attached URLs:
+${urls.length ? urls.join("\n") : "[none]"}
+`;
+
+  try {
+    const res = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
+        GEMINI_API_KEY,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }]
+            }
+          ]
+        })
+      }
+    );
+
+    const data = await res.json();
+    const textResp =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      '{"unsafe":false,"severity":1,"categories":[],"reason":"no response"}';
+
+    let parsed;
+    try {
+      parsed = JSON.parse(textResp);
+    } catch {
+      parsed = {
+        unsafe: false,
+        severity: 1,
+        categories: [],
+        reason: "parse error: " + textResp.slice(0, 120)
+      };
+    }
+
+    return {
+      unsafe: !!parsed.unsafe,
+      severity: Number(parsed.severity) || 1,
+      categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+      reason: parsed.reason || "no reason"
+    };
+  } catch (e) {
+    console.error("Gemini error:", e);
+    return { unsafe: false, severity: 1, categories: [], reason: "Gemini error" };
+  }
+}
+
+// ---------- Setup Sessions (Buttons) ----------
+const setupSessions = new Map(); // key: userId
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // register commands
   const commands = [
     {
       name: "setup",
       description: "Run FilterProtect setup (server owner / admins only)"
     }
   ];
+
   await client.application.commands.set(commands);
+  console.log("Slash commands registered.");
 });
 
 // ---------- /setup ----------
@@ -217,7 +258,7 @@ client.on(Events.InteractionCreate, async interaction => {
       await interaction.reply({
         embeds: [
           new EmbedBuilder()
-            .setTitle("FilterProtect Setup — Step 1/3")
+            .setTitle("🛡️ FilterProtect Setup — Step 1/3")
             .setDescription(
               "Welcome to **FilterProtect**.\n\n" +
                 "This wizard will:\n" +
@@ -234,245 +275,245 @@ client.on(Events.InteractionCreate, async interaction => {
     }
   }
 
-  if (interaction.isButton()) {
-    const id = interaction.customId;
-    const session = setupSessions.get(interaction.user.id);
-    if (!session) return;
+  if (!interaction.isButton()) return;
 
-    const guild = client.guilds.cache.get(session.guildId);
-    if (!guild) {
-      setupSessions.delete(interaction.user.id);
-      return interaction.update({
-        content: "❌ Guild not found. Setup cancelled.",
-        embeds: [],
-        components: []
-      });
-    }
+  const id = interaction.customId;
+  const session = setupSessions.get(interaction.user.id);
+  if (!session) return;
 
-    const guildConfig = ensureGuildConfig(guild.id);
-
-    // cancel
-    if (id === "fp_setup_cancel") {
-      setupSessions.delete(interaction.user.id);
-      return interaction.update({
-        content: "❌ Setup cancelled.",
-        embeds: [],
-        components: []
-      });
-    }
-
-    // navigation
-    if (id === "fp_setup_prev") {
-      session.step = Math.max(1, session.step - 1);
-    } else if (id === "fp_setup_next") {
-      session.step = Math.min(3, session.step + 1);
-    }
-
-    // harshness buttons
-    if (id.startsWith("fp_setup_harsh_")) {
-      const level = Number(id.split("_").pop());
-      if ([1, 2, 3, 4].includes(level)) {
-        session.harshness = level;
-      }
-    }
-
-    // toggle admin/logs
-    if (id === "fp_setup_toggle_admin") {
-      session.createAdmin = !session.createAdmin;
-    }
-    if (id === "fp_setup_toggle_logs") {
-      session.createLogs = !session.createLogs;
-    }
-
-    // finish
-    if (id === "fp_setup_finish") {
-      guildConfig.harshness = session.harshness;
-
-      // create admin role
-      if (session.createAdmin) {
-        let role = guild.roles.cache.find(r => r.name === "FilterProtect Admin");
-        if (!role) {
-          role = await guild.roles.create({
-            name: "FilterProtect Admin",
-            permissions: [PermissionsBitField.Flags.ManageMessages]
-          });
-        }
-        guildConfig.adminRoleId = role.id;
-      }
-
-      // create logs channel
-      if (session.createLogs) {
-        let ch = guild.channels.cache.find(
-          c => c.name === "filterprotect-logs" && c.isTextBased()
-        );
-        if (!ch) {
-          ch = await guild.channels.create({
-            name: "filterprotect-logs",
-            type: 0
-          });
-        }
-        guildConfig.logsChannelId = ch.id;
-      }
-
-      saveConfig();
-      setupSessions.delete(interaction.user.id);
-
-      await interaction.update({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("✅ FilterProtect Setup Complete")
-            .setDescription(
-              `Harshness: **${guildConfig.harshness}**\n` +
-                `Admin role: ${
-                  guildConfig.adminRoleId ? `<@&${guildConfig.adminRoleId}>` : "Not created"
-                }\n` +
-                `Logs channel: ${
-                  guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not created"
-                }\n\n` +
-                "FilterProtect is now active and using **Gemini** to scan every message."
-            )
-            .setColor("#57F287")
-        ],
-        components: []
-      });
-
-      await logEvent(
-        guild,
-        guildConfig,
-        "✅ FilterProtect Setup Complete",
-        `Setup finished by ${interaction.user.tag}.`
-      );
-
-      return;
-    }
-
-    // re-render current step
-    const step = session.step;
-    let embed;
-    let components = [];
-
-    if (step === 1) {
-      embed = new EmbedBuilder()
-        .setTitle("FilterProtect Setup — Step 1/3")
-        .setDescription(
-          "Welcome to **FilterProtect**.\n\n" +
-            "This wizard will:\n" +
-            "• Create a `FilterProtect Admin` role\n" +
-            "• Create a `filterprotect-logs` channel\n" +
-            "• Let you choose **harshness**\n\n" +
-            "Click **Next** to continue."
-        )
-        .setColor("#5865F2");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_next")
-            .setLabel("Next ➜")
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    } else if (step === 2) {
-      embed = new EmbedBuilder()
-        .setTitle("FilterProtect Setup — Step 2/3 (Harshness)")
-        .setDescription(
-          "Choose a **harshness level**:\n\n" +
-            "1 = Soft (delete + warn)\n" +
-            "2 = Medium (delete + warn + strike)\n" +
-            "3 = Hard (delete + timeout)\n" +
-            "4 = Extreme (delete + timeout + auto‑kick at 3 strikes)\n\n" +
-            `Current selection: **${session.harshness}**`
-        )
-        .setColor("#FEE75C");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_1")
-            .setLabel("1")
-            .setStyle(session.harshness === 1 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_2")
-            .setLabel("2")
-            .setStyle(session.harshness === 2 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_3")
-            .setLabel("3")
-            .setStyle(session.harshness === 3 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_4")
-            .setLabel("4")
-            .setStyle(session.harshness === 4 ? ButtonStyle.Success : ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_prev")
-            .setLabel("⬅ Previous")
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_next")
-            .setLabel("Next ➜")
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    } else if (step === 3) {
-      embed = new EmbedBuilder()
-        .setTitle("FilterProtect Setup — Step 3/3 (Roles & Logs)")
-        .setDescription(
-          "Choose what FilterProtect should create:\n\n" +
-            `Admin role: **${session.createAdmin ? "Create `FilterProtect Admin`" : "Do not create"}**\n` +
-            `Logs channel: **${
-              session.createLogs ? "Create `filterprotect-logs`" : "Do not create"
-            }**\n\n` +
-            "Click **Finish** to apply settings."
-        )
-        .setColor("#57F287");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_toggle_admin")
-            .setLabel(
-              session.createAdmin ? "Disable Admin Role Creation" : "Enable Admin Role Creation"
-            )
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_toggle_logs")
-            .setLabel(
-              session.createLogs ? "Disable Logs Channel Creation" : "Enable Logs Channel Creation"
-            )
-            .setStyle(ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_prev")
-            .setLabel("⬅ Previous")
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_finish")
-            .setLabel("Finish ✅")
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    }
-
-    await interaction.update({ embeds: [embed], components });
+  const guild = client.guilds.cache.get(session.guildId);
+  if (!guild) {
+    setupSessions.delete(interaction.user.id);
+    return interaction.update({
+      content: "❌ Guild not found. Setup cancelled.",
+      embeds: [],
+      components: []
+    });
   }
+
+  const guildConfig = ensureGuildConfig(guild.id);
+
+  // cancel
+  if (id === "fp_setup_cancel") {
+    setupSessions.delete(interaction.user.id);
+    return interaction.update({
+      content: "❌ Setup cancelled.",
+      embeds: [],
+      components: []
+    });
+  }
+
+  // navigation
+  if (id === "fp_setup_prev") {
+    session.step = Math.max(1, session.step - 1);
+  } else if (id === "fp_setup_next") {
+    session.step = Math.min(3, session.step + 1);
+  }
+
+  // harshness buttons
+  if (id.startsWith("fp_setup_harsh_")) {
+    const level = Number(id.split("_").pop());
+    if ([1, 2, 3, 4].includes(level)) {
+      session.harshness = level;
+    }
+  }
+
+  // toggle admin/logs
+  if (id === "fp_setup_toggle_admin") {
+    session.createAdmin = !session.createAdmin;
+  }
+  if (id === "fp_setup_toggle_logs") {
+    session.createLogs = !session.createLogs;
+  }
+
+  // finish
+  if (id === "fp_setup_finish") {
+    guildConfig.harshness = session.harshness;
+
+    // create admin role
+    if (session.createAdmin) {
+      let role = guild.roles.cache.find(r => r.name === "FilterProtect Admin");
+      if (!role) {
+        role = await guild.roles.create({
+          name: "FilterProtect Admin",
+          permissions: [PermissionsBitField.Flags.ManageMessages]
+        });
+      }
+      guildConfig.adminRoleId = role.id;
+    }
+
+    // create logs channel
+    if (session.createLogs) {
+      let ch = guild.channels.cache.find(
+        c => c.name === "filterprotect-logs" && c.isTextBased()
+      );
+      if (!ch) {
+        ch = await guild.channels.create({
+          name: "filterprotect-logs",
+          type: 0
+        });
+      }
+      guildConfig.logsChannelId = ch.id;
+    }
+
+    saveConfig();
+    setupSessions.delete(interaction.user.id);
+
+    await interaction.update({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("✅ FilterProtect Setup Complete")
+          .setDescription(
+            `Harshness: **${guildConfig.harshness}**\n` +
+              `Admin role: ${
+                guildConfig.adminRoleId ? `<@&${guildConfig.adminRoleId}>` : "Not created"
+              }\n` +
+              `Logs channel: ${
+                guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not created"
+              }\n\n` +
+              "FilterProtect is now active and using **Gemini** to scan every message, link, image, and attachment."
+          )
+          .setColor("#57F287")
+      ],
+      components: []
+    });
+
+    await logEvent(
+      guild,
+      guildConfig,
+      "✅ FilterProtect Setup Complete",
+      `Setup finished by ${interaction.user.tag}.`
+    );
+
+    return;
+  }
+
+  // re-render current step
+  const step = session.step;
+  let embed;
+  let components = [];
+
+  if (step === 1) {
+    embed = new EmbedBuilder()
+      .setTitle("🛡️ FilterProtect Setup — Step 1/3")
+      .setDescription(
+        "Welcome to **FilterProtect**.\n\n" +
+          "This wizard will:\n" +
+          "• Create a `FilterProtect Admin` role\n" +
+          "• Create a `filterprotect-logs` channel\n" +
+          "• Let you choose **harshness**\n\n" +
+          "Click **Next** to continue."
+      )
+      .setColor("#5865F2");
+
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fp_setup_next")
+          .setLabel("Next ➜")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_cancel")
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Danger)
+      )
+    ];
+  } else if (step === 2) {
+    embed = new EmbedBuilder()
+      .setTitle("🛡️ FilterProtect Setup — Step 2/3 (Harshness)")
+      .setDescription(
+        "Choose a **harshness level**:\n\n" +
+          "1 = Soft (delete + warn)\n" +
+          "2 = Medium (delete + warn + strike)\n" +
+          "3 = Hard (delete + timeout)\n" +
+          "4 = Extreme (delete + timeout + auto‑kick at 3 strikes)\n\n" +
+          `Current selection: **${session.harshness}**`
+      )
+      .setColor("#FEE75C");
+
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fp_setup_harsh_1")
+          .setLabel("1")
+          .setStyle(session.harshness === 1 ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_harsh_2")
+          .setLabel("2")
+          .setStyle(session.harshness === 2 ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_harsh_3")
+          .setLabel("3")
+          .setStyle(session.harshness === 3 ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_harsh_4")
+          .setLabel("4")
+          .setStyle(session.harshness === 4 ? ButtonStyle.Success : ButtonStyle.Secondary)
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fp_setup_prev")
+          .setLabel("⬅ Previous")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_next")
+          .setLabel("Next ➜")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_cancel")
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Danger)
+      )
+    ];
+  } else if (step === 3) {
+    embed = new EmbedBuilder()
+      .setTitle("🛡️ FilterProtect Setup — Step 3/3 (Roles & Logs)")
+      .setDescription(
+        "Choose what FilterProtect should create:\n\n" +
+          `Admin role: **${session.createAdmin ? "Create `FilterProtect Admin`" : "Do not create"}**\n` +
+          `Logs channel: **${
+            session.createLogs ? "Create `filterprotect-logs`" : "Do not create"
+          }**\n\n` +
+          "Click **Finish** to apply settings."
+      )
+      .setColor("#57F287");
+
+    components = [
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fp_setup_toggle_admin")
+          .setLabel(
+            session.createAdmin ? "Disable Admin Role Creation" : "Enable Admin Role Creation"
+          )
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_toggle_logs")
+          .setLabel(
+            session.createLogs ? "Disable Logs Channel Creation" : "Enable Logs Channel Creation"
+          )
+          .setStyle(ButtonStyle.Secondary)
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fp_setup_prev")
+          .setLabel("⬅ Previous")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_finish")
+          .setLabel("Finish ✅")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId("fp_setup_cancel")
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Danger)
+      )
+    ];
+  }
+
+  await interaction.update({ embeds: [embed], components });
 });
 
-// ---------- MODERATION ----------
+// ---------- Moderation ----------
 client.on("messageCreate", async message => {
   if (!message.guild || message.author.bot) return;
 
@@ -482,12 +523,12 @@ client.on("messageCreate", async message => {
   const text = message.content || "";
   const urls = [];
 
-  // collect attachment URLs (images, videos, files)
+  // attachments (images, videos, files)
   for (const att of message.attachments.values()) {
     if (att.url) urls.push(att.url);
   }
 
-  // collect link-like substrings from text
+  // links in text
   const linkRegex = /(https?:\/\/[^\s]+)/gi;
   let match;
   while ((match = linkRegex.exec(text)) !== null) {
@@ -497,10 +538,9 @@ client.on("messageCreate", async message => {
   const result = await geminiModerate(text, urls);
   if (!result.unsafe) return;
 
-  async function punish(reason) {
+  async function punish(reason, severity) {
     try {
       await message.delete().catch(() => {});
-      const harsh = guildConfig.harshness;
 
       await message.channel
         .send({
@@ -508,19 +548,24 @@ client.on("messageCreate", async message => {
         })
         .then(m => setTimeout(() => m.delete().catch(() => {}), 7000));
 
-      if (harsh >= 2) {
+      const harsh = guildConfig.harshness;
+
+      // strikes
+      if (harsh >= 2 || severity >= 2) {
         if (!guildConfig.strikes[message.author.id]) guildConfig.strikes[message.author.id] = 0;
         guildConfig.strikes[message.author.id]++;
         saveConfig();
       }
 
-      if (harsh >= 3) {
+      // timeout
+      if (harsh >= 3 || severity >= 3) {
         try {
           await message.member.timeout(10 * 60 * 1000, "FilterProtect auto-timeout (Gemini)");
         } catch {}
       }
 
-      if (harsh === 4) {
+      // kick on 3 strikes at harsh 4 or severity 4
+      if (harsh === 4 || severity === 4) {
         const strikes = guildConfig.strikes[message.author.id] || 0;
         if (strikes >= 3) {
           try {
@@ -533,11 +578,20 @@ client.on("messageCreate", async message => {
         message.guild,
         guildConfig,
         "🚨 FilterProtect Action (Gemini)",
-        `Gemini flagged content as unsafe: **${result.reason}**`,
+        `Gemini flagged content as unsafe.\nReason: **${reason}**`,
         [
           { name: "User", value: `${message.author.tag} (${message.author.id})`, inline: true },
           { name: "Channel", value: `${message.channel}`, inline: true },
-          { name: "Reason", value: result.reason || "unknown", inline: false },
+          {
+            name: "Severity",
+            value: `${severity} (1=low, 4=extreme)`,
+            inline: true
+          },
+          {
+            name: "Categories",
+            value: result.categories.length ? result.categories.join(", ") : "[none]",
+            inline: false
+          },
           { name: "Content", value: text || "[no text]", inline: false },
           { name: "URLs", value: urls.join("\n") || "[none]", inline: false }
         ]
@@ -547,10 +601,10 @@ client.on("messageCreate", async message => {
     }
   }
 
-  await punish(result.reason || "Inappropriate content");
+  await punish(result.reason || "Inappropriate content", result.severity || 1);
 });
 
-// ---------- GUILD JOIN ----------
+// ---------- Guild Join ----------
 client.on(Events.GuildCreate, async guild => {
   ensureGuildConfig(guild.id);
   saveConfig();
@@ -559,7 +613,7 @@ client.on(Events.GuildCreate, async guild => {
   if (!channel) return;
 
   const embed = new EmbedBuilder()
-    .setTitle("👋 Welcome to FilterProtect")
+    .setTitle("👋 Welcome to FilterProtect (Gemini)")
     .setDescription(
       "Thanks for adding **FilterProtect**.\n\n" +
         "Use `/setup` (server owner / admins) to configure harshness and logging.\n" +
@@ -570,5 +624,7 @@ client.on(Events.GuildCreate, async guild => {
   await channel.send({ embeds: [embed] });
 });
 
-// ---------- LOGIN ----------
+// ---------- Login ----------
+console.log("Starting FilterProtect...");
+console.log("DISCORD_TOKEN present:", !!process.env.DISCORD_TOKEN);
 client.login(process.env.DISCORD_TOKEN);
