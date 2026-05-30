@@ -1,7 +1,6 @@
 {
   "name": "filterprotect",
-  "version": "3.0.0",
-  "description": "FilterProtect Discord Bot with Gemini moderation and settings dashboard",
+  "version": "1.0.0",
   "main": "filterprotect.js",
   "scripts": {
     "start": "node filterprotect.js"
@@ -9,6 +8,7 @@
   "dependencies": {
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
   }
 }
