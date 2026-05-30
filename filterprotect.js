@@ -1,4 +1,8 @@
 // ---------- Render Port Fix ----------
+console.log("=== FilterProtect starting ===");
+console.log("DISCORD_TOKEN exists:", !!process.env.DISCORD_TOKEN);
+console.log("GEMINI_API_KEY exists:", !!process.env.GEMINI_API_KEY);
+
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -627,4 +631,9 @@ client.on(Events.GuildCreate, async guild => {
 // ---------- Login ----------
 console.log("Starting FilterProtect...");
 console.log("DISCORD_TOKEN present:", !!process.env.DISCORD_TOKEN);
+console.log("Attempting Discord login...");
 client.login(process.env.DISCORD_TOKEN);
+client.once("ready", () => {
+  console.log("=== BOT ONLINE === Logged in as " + client.user.tag);
+});
+
