@@ -1,59 +1,59 @@
-// ---------- Render / Express keep-alive ----------
+// =========================
+// FilterProtect — Clean Version
+// =========================
+
+require("dotenv").config();
+const fetch = (...args) => import("node-fetch").then(({default: fetch}) => fetch(...args));
 const express = require("express");
 const app = express();
-const PORT = process.env.PORT || 3000;
-app.get("/", (_req, res) => res.send("FilterProtect is running."));
-app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
+app.get("/", (req, res) => res.send("FilterProtect is running."));
+app.listen(process.env.PORT || 3000);
 
-// ---------- Imports ----------
-require("dotenv").config();
 const {
   Client,
   GatewayIntentBits,
   Partials,
+  SlashCommandBuilder,
   EmbedBuilder,
-  PermissionsBitField,
-  Events,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  SlashCommandBuilder
+  PermissionsBitField
 } = require("discord.js");
+
 const fs = require("fs");
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const CONFIG_FILE = "./filterprotect_config.json";
+// =========================
+// CONFIG SYSTEM
+// =========================
 
-// ---------- Config ----------
-let config = { guilds: {} };
-
-if (fs.existsSync(CONFIG_FILE)) {
-  try {
-    config = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
-  } catch {
-    config = { guilds: {} };
-  }
-}
+const CONFIG_FILE = "./config.json";
+let config = fs.existsSync(CONFIG_FILE)
+  ? JSON.parse(fs.readFileSync(CONFIG_FILE))
+  : { guilds: {} };
 
 function saveConfig() {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
-function ensureGuildConfig(guildId) {
-  if (!config.guilds[guildId]) {
-    config.guilds[guildId] = {
+function ensureGuild(gid) {
+  if (!config.guilds[gid]) {
+    config.guilds[gid] = {
+      strikes: {},
       harshness: 2,
-      scanningEnabled: true,
-      punishmentsEnabled: true,
-      logsChannelId: null,
-      adminRoleId: null,
-      strikes: {}
+      autoKick: true,
+      scanning: true,
+      punishments: true,
+      logsChannel: null
     };
   }
-  return config.guilds[guildId];
+  return config.guilds[gid];
 }
 
-// ---------- Client ----------
+// =========================
+// DISCORD CLIENT
+// =========================
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -61,792 +61,327 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers
   ],
-  partials: [Partials.Channel, Partials.Message, Partials.GuildMember]
+  partials: [Partials.Message, Partials.Channel, Partials.GuildMember]
 });
 
-// ---------- Utils ----------
-function isOwnerOrAdmin(member) {
-  if (!member || !member.guild) return false;
-  if (member.id === member.guild.ownerId) return true;
-  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
-  const guildConfig = ensureGuildConfig(member.guild.id);
-  if (guildConfig.adminRoleId && member.roles.cache.has(guildConfig.adminRoleId)) return true;
-  return false;
-}
+// =========================
+// GEMINI AI — FIXED ENDPOINT
+// =========================
 
-async function logEvent(guild, guildConfig, title, description, fields = []) {
-  try {
-    let channel = guildConfig.logsChannelId
-      ? guild.channels.cache.get(guildConfig.logsChannelId)
-      : null;
-
-    if (!channel) {
-      channel = guild.channels.cache.find(
-        c => c.name === "filterprotect-logs" && c.isTextBased()
-      );
-      if (!channel) {
-        channel = await guild.channels.create({
-          name: "filterprotect-logs",
-          type: 0
-        });
-      }
-      guildConfig.logsChannelId = channel.id;
-      saveConfig();
-    }
-
-    const embed = new EmbedBuilder()
-      .setTitle(title)
-      .setDescription(description)
-      .setColor("#ff5555")
-      .setTimestamp();
-
-    if (fields.length) embed.addFields(fields);
-
-    await channel.send({ embeds: [embed] });
-  } catch (e) {
-    console.error("Log error:", e);
-  }
-}
-
-// ---------- Gemini Moderation ----------
-async function geminiModerate(text, urls = []) {
-  if (!GEMINI_API_KEY) {
-    console.warn("No GEMINI_API_KEY set.");
-    return { unsafe: false, severity: 1, categories: [], reason: "No API key" };
-  }
-
+async function geminiModerate(text, urls) {
   const prompt = `
-You are an advanced moderation AI for a Discord server.
+You are a Discord moderation AI. Analyze the message and return ONLY JSON:
 
-Analyze the following message and attached URLs (which may be images, videos, or external links).
-
-Classify for:
-- sexual content (including minors, grooming)
-- nudity
-- violence / gore
-- hate / harassment / slurs
-- self-harm / suicide
-- extremism / terrorism
-- scams / fraud / malware
-- drugs / weapons
-- highly explicit memes or content
-
-Return ONLY a compact JSON object like:
 {
-  "unsafe": true,
+  "unsafe": true/false,
   "severity": 1-4,
-  "categories": ["sexual", "violence"],
-  "reason": "short human-readable summary"
+  "reason": "short reason"
 }
 
-Where:
-- unsafe = true if the message should be blocked
-- severity:
-  1 = mild (warning)
-  2 = medium (strike)
-  3 = high (timeout)
-  4 = extreme (kick/ban level)
-- categories = list of tags
-- reason = short explanation
+Message:
+${text}
 
-Message text:
-${text || "[no text]"}
-
-Attached URLs:
-${urls.length ? urls.join("\n") : "[none]"}
+Attachments:
+${urls.join("\n")}
 `;
 
   try {
     const res = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
-        GEMINI_API_KEY,
+        process.env.GEMINI_API_KEY,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: prompt }]
-            }
-          ]
+          contents: [{ role: "user", parts: [{ text: prompt }] }]
         })
       }
     );
 
     const data = await res.json();
-    const textResp =
+    const raw =
       data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      '{"unsafe":false,"severity":1,"categories":[],"reason":"no response"}';
+      '{"unsafe":false,"severity":1,"reason":"no response"}';
 
-    let parsed;
-    try {
-      parsed = JSON.parse(textResp);
-    } catch {
-      parsed = {
-        unsafe: false,
-        severity: 1,
-        categories: [],
-        reason: "parse error: " + textResp.slice(0, 120)
-      };
-    }
-
-    return {
-      unsafe: !!parsed.unsafe,
-      severity: Number(parsed.severity) || 1,
-      categories: Array.isArray(parsed.categories) ? parsed.categories : [],
-      reason: parsed.reason || "no reason"
-    };
-  } catch (e) {
-    console.error("Gemini error:", e);
-    return { unsafe: false, severity: 1, categories: [], reason: "Gemini error" };
+    return JSON.parse(raw);
+  } catch (err) {
+    console.log("Gemini error:", err);
+    return { unsafe: false, severity: 1, reason: "Gemini error" };
   }
 }
 
-// ---------- Setup Sessions ----------
-const setupSessions = new Map(); // key: userId
+// =========================
+// LOGGING
+// =========================
 
-client.once(Events.ClientReady, async () => {
+async function logEvent(guild, cfg, title, desc) {
+  let ch = cfg.logsChannel
+    ? guild.channels.cache.get(cfg.logsChannel)
+    : null;
+
+  if (!ch) {
+    ch = await guild.channels.create({
+      name: "filterprotect-logs",
+      type: 0
+    });
+    cfg.logsChannel = ch.id;
+    saveConfig();
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setDescription(desc)
+    .setColor("#ff4444")
+    .setTimestamp();
+
+  ch.send({ embeds: [embed] });
+}
+
+// =========================
+// SLASH COMMANDS
+// =========================
+
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   const commands = [
     new SlashCommandBuilder()
-      .setName("setup")
-      .setDescription("Run FilterProtect setup (server owner / admins only)")
-      .toJSON(),
-    new SlashCommandBuilder()
       .setName("settings")
-      .setDescription("Open FilterProtect settings dashboard")
+      .setDescription("Open FilterProtect settings panel")
       .toJSON(),
+
     new SlashCommandBuilder()
       .setName("log")
-      .setDescription("Create a moderation log and add a strike")
+      .setDescription("Log a user and add a strike")
       .addUserOption(o =>
-        o.setName("user").setDescription("User to log").setRequired(true)
+        o.setName("user").setDescription("User").setRequired(true)
       )
       .addStringOption(o =>
-        o.setName("reason").setDescription("Reason for the log").setRequired(true)
+        o.setName("reason").setDescription("Reason").setRequired(true)
       )
       .toJSON(),
+
     new SlashCommandBuilder()
       .setName("strikes")
       .setDescription("View strikes for a user")
       .addUserOption(o =>
-        o.setName("user").setDescription("User to check").setRequired(true)
+        o.setName("user").setDescription("User").setRequired(true)
+      )
+      .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName("removestrike")
+      .setDescription("Remove strikes from a user")
+      .addUserOption(o =>
+        o.setName("user").setDescription("User").setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o.setName("amount").setDescription("Amount").setRequired(true)
+      )
+      .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName("purge")
+      .setDescription("Bulk delete messages")
+      .addIntegerOption(o =>
+        o.setName("amount").setDescription("Amount").setRequired(true)
+      )
+      .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName("timeout")
+      .setDescription("Timeout a user")
+      .addUserOption(o =>
+        o.setName("user").setDescription("User").setRequired(true)
+      )
+      .addIntegerOption(o =>
+        o.setName("minutes").setDescription("Minutes").setRequired(true)
+      )
+      .addStringOption(o =>
+        o.setName("reason").setDescription("Reason").setRequired(true)
       )
       .toJSON()
   ];
 
   await client.application.commands.set(commands);
-  console.log("Slash commands registered.");
 });
 
-// ---------- /setup & /settings & /log & /strikes ----------
-client.on(Events.InteractionCreate, async interaction => {
-  if (interaction.isChatInputCommand()) {
-    const { commandName } = interaction;
+// =========================
+// SETTINGS PANEL (BUTTONS)
+// =========================
 
-    if (commandName === "setup") {
-      if (!interaction.inGuild()) {
-        return interaction.reply({
-          content: "❌ Setup must be run inside a server.",
-          ephemeral: true
-        });
-      }
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand() && !interaction.isButton()) return;
 
-      if (!isOwnerOrAdmin(interaction.member)) {
-        return interaction.reply({
-          content: "❌ Only the **server owner**, **Administrators**, or **FilterProtect Admin** can run `/setup`.",
-          ephemeral: true
-        });
-      }
+  const gid = interaction.guild.id;
+  const cfg = ensureGuild(gid);
 
-      const guildId = interaction.guild.id;
-      ensureGuildConfig(guildId);
-
-      setupSessions.set(interaction.user.id, {
-        guildId,
-        step: 1,
-        harshness: 2,
-        createAdmin: true,
-        createLogs: true
-      });
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("fp_setup_next")
-          .setLabel("Next ➜")
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId("fp_setup_cancel")
-          .setLabel("Cancel")
-          .setStyle(ButtonStyle.Danger)
+  // SETTINGS PANEL
+  if (interaction.isChatInputCommand() && interaction.commandName === "settings") {
+    const embed = new EmbedBuilder()
+      .setTitle("⚙️ FilterProtect Settings")
+      .setColor("#5865F2")
+      .setDescription(
+        `**AI Scanning:** ${cfg.scanning ? "🟢 ON" : "🔴 OFF"}\n` +
+        `**Punishments:** ${cfg.punishments ? "🟢 ON" : "🔴 OFF"}\n` +
+        `**Auto‑Kick at 3 Strikes:** ${cfg.autoKick ? "🟢 ON" : "🔴 OFF"}\n` +
+        `**Harshness:** ${cfg.harshness} (1–4)`
       );
 
-      await interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("🛡️ FilterProtect Setup — Step 1/3")
-            .setDescription(
-              "Welcome to **FilterProtect**.\n\n" +
-                "This wizard will:\n" +
-                "• Create a `FilterProtect Admin` role\n" +
-                "• Create a `filterprotect-logs` channel\n" +
-                "• Let you choose **harshness**\n\n" +
-                "Click **Next** to continue."
-            )
-            .setColor("#5865F2")
-        ],
-        components: [row],
-        ephemeral: true
-      });
-    }
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("toggle_scanning")
+        .setLabel("Toggle Scanning")
+        .setStyle(ButtonStyle.Primary),
 
-    if (commandName === "settings") {
-      if (!interaction.inGuild()) {
-        return interaction.reply({
-          content: "❌ Settings must be used inside a server.",
-          ephemeral: true
-        });
-      }
+      new ButtonBuilder()
+        .setCustomId("toggle_punish")
+        .setLabel("Toggle Punishments")
+        .setStyle(ButtonStyle.Primary),
 
-      if (!isOwnerOrAdmin(interaction.member)) {
-        return interaction.reply({
-          content: "❌ Only the **server owner**, **Administrators**, or **FilterProtect Admin** can use `/settings`.",
-          ephemeral: true
-        });
-      }
+      new ButtonBuilder()
+        .setCustomId("toggle_autokick")
+        .setLabel("Toggle AutoKick")
+        .setStyle(ButtonStyle.Danger)
+    );
 
-      const guildConfig = ensureGuildConfig(interaction.guild.id);
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("harsh_down")
+        .setLabel("Harshness -")
+        .setStyle(ButtonStyle.Secondary),
 
-      const embed = new EmbedBuilder()
-        .setTitle("🛠️ FilterProtect Settings")
-        .setDescription(
-          `**Scanning:** ${guildConfig.scanningEnabled ? "✅ Enabled" : "❌ Disabled"}\n` +
-            `**Punishments:** ${guildConfig.punishmentsEnabled ? "✅ Enabled" : "❌ Disabled"}\n` +
-            `**Harshness:** **${guildConfig.harshness}** (1=soft, 4=extreme)\n\n` +
-            "Use the buttons below to toggle features."
-        )
-        .setColor("#5865F2");
+      new ButtonBuilder()
+        .setCustomId("harsh_up")
+        .setLabel("Harshness +")
+        .setStyle(ButtonStyle.Secondary)
+    );
 
-      const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("fp_settings_toggle_scanning")
-          .setLabel(
-            guildConfig.scanningEnabled ? "Disable Scanning" : "Enable Scanning"
-          )
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("fp_settings_toggle_punish")
-          .setLabel(
-            guildConfig.punishmentsEnabled ? "Disable Punishments" : "Enable Punishments"
-          )
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("fp_settings_harsh_down")
-          .setLabel("Harshness -")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("fp_settings_harsh_up")
-          .setLabel("Harshness +")
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      await interaction.reply({
-        embeds: [embed],
-        components: [row1, row2],
-        ephemeral: true
-      });
-    }
-
-    if (commandName === "log") {
-      if (!interaction.inGuild()) {
-        return interaction.reply({
-          content: "❌ Must be used in a server.",
-          ephemeral: true
-        });
-      }
-
-      if (!isOwnerOrAdmin(interaction.member)) {
-        return interaction.reply({
-          content: "❌ You need **FilterProtect Admin**, **Administrator**, or be **server owner** to use `/log`.",
-          ephemeral: true
-        });
-      }
-
-      const target = interaction.options.getUser("user", true);
-      const reason = interaction.options.getString("reason", true);
-      const guildConfig = ensureGuildConfig(interaction.guild.id);
-
-      if (!guildConfig.strikes[target.id]) guildConfig.strikes[target.id] = 0;
-      guildConfig.strikes[target.id]++;
-      saveConfig();
-
-      await logEvent(
-        interaction.guild,
-        guildConfig,
-        "📝 Manual Log (Command)",
-        `Log created via \`/log\`.\nTarget: **${target.tag}**\nReason: **${reason}**\nStrikes: **${guildConfig.strikes[target.id]}**`
-      );
-
-      return interaction.reply({
-        content: `✅ Logged **${target.tag}** and added a strike. Total strikes: **${guildConfig.strikes[target.id]}**`,
-        ephemeral: true
-      });
-    }
-
-    if (commandName === "strikes") {
-      if (!interaction.inGuild()) {
-        return interaction.reply({
-          content: "❌ Must be used in a server.",
-          ephemeral: true
-        });
-      }
-
-      const target = interaction.options.getUser("user", true);
-      const guildConfig = ensureGuildConfig(interaction.guild.id);
-      const count = guildConfig.strikes[target.id] || 0;
-
-      return interaction.reply({
-        content: `📊 **${target.tag}** has **${count}** strike(s).`,
-        ephemeral: true
-      });
-    }
+    return interaction.reply({
+      embeds: [embed],
+      components: [row, row2],
+      ephemeral: true
+    });
   }
 
-  // ---------- Button handling (setup + settings) ----------
+  // BUTTON HANDLING
   if (interaction.isButton()) {
-    const id = interaction.customId;
+    if (interaction.customId === "toggle_scanning") cfg.scanning = !cfg.scanning;
+    if (interaction.customId === "toggle_punish") cfg.punishments = !cfg.punishments;
+    if (interaction.customId === "toggle_autokick") cfg.autoKick = !cfg.autoKick;
+    if (interaction.customId === "harsh_down") cfg.harshness = Math.max(1, cfg.harshness - 1);
+    if (interaction.customId === "harsh_up") cfg.harshness = Math.min(4, cfg.harshness + 1);
 
-    // SETTINGS buttons
-    if (id.startsWith("fp_settings_")) {
-      if (!interaction.inGuild() || !isOwnerOrAdmin(interaction.member)) {
-        return interaction.reply({
-          content: "❌ You are not allowed to change settings.",
-          ephemeral: true
-        });
-      }
+    saveConfig();
 
-      const guildConfig = ensureGuildConfig(interaction.guild.id);
-
-      if (id === "fp_settings_toggle_scanning") {
-        guildConfig.scanningEnabled = !guildConfig.scanningEnabled;
-      }
-      if (id === "fp_settings_toggle_punish") {
-        guildConfig.punishmentsEnabled = !guildConfig.punishmentsEnabled;
-      }
-      if (id === "fp_settings_harsh_down") {
-        guildConfig.harshness = Math.max(1, guildConfig.harshness - 1);
-      }
-      if (id === "fp_settings_harsh_up") {
-        guildConfig.harshness = Math.min(4, guildConfig.harshness + 1);
-      }
-
-      saveConfig();
-
-      const embed = new EmbedBuilder()
-        .setTitle("🛠️ FilterProtect Settings")
-        .setDescription(
-          `**Scanning:** ${guildConfig.scanningEnabled ? "✅ Enabled" : "❌ Disabled"}\n` +
-            `**Punishments:** ${guildConfig.punishmentsEnabled ? "✅ Enabled" : "❌ Disabled"}\n` +
-            `**Harshness:** **${guildConfig.harshness}** (1=soft, 4=extreme)\n\n` +
-            "Use the buttons below to toggle features."
-        )
-        .setColor("#5865F2");
-
-      const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("fp_settings_toggle_scanning")
-          .setLabel(
-            guildConfig.scanningEnabled ? "Disable Scanning" : "Enable Scanning"
+    return interaction.update({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("⚙️ FilterProtect Settings")
+          .setColor("#5865F2")
+          .setDescription(
+            `**AI Scanning:** ${cfg.scanning ? "🟢 ON" : "🔴 OFF"}\n` +
+            `**Punishments:** ${cfg.punishments ? "🟢 ON" : "🔴 OFF"}\n` +
+            `**Auto‑Kick at 3 Strikes:** ${cfg.autoKick ? "🟢 ON" : "🔴 OFF"}\n` +
+            `**Harshness:** ${cfg.harshness} (1–4)`
           )
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("fp_settings_toggle_punish")
-          .setLabel(
-            guildConfig.punishmentsEnabled ? "Disable Punishments" : "Enable Punishments"
-          )
-          .setStyle(ButtonStyle.Secondary)
-      );
+      ],
+      components: interaction.message.components
+    });
+  }
 
-      const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("fp_settings_harsh_down")
-          .setLabel("Harshness -")
-          .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-          .setCustomId("fp_settings_harsh_up")
-          .setLabel("Harshness +")
-          .setStyle(ButtonStyle.Secondary)
-      );
+  // =========================
+  // MODERATION COMMANDS
+  // =========================
 
-      return interaction.update({ embeds: [embed], components: [row1, row2] });
-    }
+  if (interaction.commandName === "log") {
+    const user = interaction.options.getUser("user");
+    const reason = interaction.options.getString("reason");
 
-    // SETUP buttons
-    const session = setupSessions.get(interaction.user.id);
-    if (!session) return;
+    cfg.strikes[user.id] = (cfg.strikes[user.id] || 0) + 1;
+    saveConfig();
 
-    const guild = client.guilds.cache.get(session.guildId);
-    if (!guild) {
-      setupSessions.delete(interaction.user.id);
-      return interaction.update({
-        content: "❌ Guild not found. Setup cancelled.",
-        embeds: [],
-        components: []
-      });
-    }
+    await logEvent(interaction.guild, cfg, "Manual Log", `${user.tag} — ${reason}`);
+    return interaction.reply({ content: `Logged ${user.tag}`, ephemeral: true });
+  }
 
-    const guildConfig = ensureGuildConfig(guild.id);
+  if (interaction.commandName === "strikes") {
+    const user = interaction.options.getUser("user");
+    const count = cfg.strikes[user.id] || 0;
+    return interaction.reply({ content: `${user.tag} has ${count} strikes.`, ephemeral: true });
+  }
 
-    if (id === "fp_setup_cancel") {
-      setupSessions.delete(interaction.user.id);
-      return interaction.update({
-        content: "❌ Setup cancelled.",
-        embeds: [],
-        components: []
-      });
-    }
+  if (interaction.commandName === "removestrike") {
+    const user = interaction.options.getUser("user");
+    const amt = interaction.options.getInteger("amount");
 
-    if (id === "fp_setup_prev") {
-      session.step = Math.max(1, session.step - 1);
-    } else if (id === "fp_setup_next") {
-      session.step = Math.min(3, session.step + 1);
-    }
+    cfg.strikes[user.id] = Math.max(0, (cfg.strikes[user.id] || 0) - amt);
+    saveConfig();
 
-    if (id.startsWith("fp_setup_harsh_")) {
-      const level = Number(id.split("_").pop());
-      if ([1, 2, 3, 4].includes(level)) session.harshness = level;
-    }
+    return interaction.reply({ content: `Removed ${amt} strikes from ${user.tag}.`, ephemeral: true });
+  }
 
-    if (id === "fp_setup_toggle_admin") {
-      session.createAdmin = !session.createAdmin;
-    }
-    if (id === "fp_setup_toggle_logs") {
-      session.createLogs = !session.createLogs;
-    }
+  if (interaction.commandName === "purge") {
+    const amt = interaction.options.getInteger("amount");
+    const channel = interaction.channel;
 
-    if (id === "fp_setup_finish") {
-      guildConfig.harshness = session.harshness;
+    await channel.bulkDelete(amt, true);
+    return interaction.reply({ content: `Purged ${amt} messages.`, ephemeral: true });
+  }
 
-      if (session.createAdmin) {
-        let role = guild.roles.cache.find(r => r.name === "FilterProtect Admin");
-        if (!role) {
-          role = await guild.roles.create({
-            name: "FilterProtect Admin",
-            permissions: [PermissionsBitField.Flags.ManageMessages]
-          });
-        }
-        guildConfig.adminRoleId = role.id;
-      }
+  if (interaction.commandName === "timeout") {
+    const user = interaction.options.getUser("user");
+    const mins = interaction.options.getInteger("minutes");
+    const reason = interaction.options.getString("reason");
 
-      if (session.createLogs) {
-        let ch = guild.channels.cache.find(
-          c => c.name === "filterprotect-logs" && c.isTextBased()
-        );
-        if (!ch) {
-          ch = await guild.channels.create({
-            name: "filterprotect-logs",
-            type: 0
-          });
-        }
-        guildConfig.logsChannelId = ch.id;
-      }
+    const member = interaction.guild.members.cache.get(user.id);
+    await member.timeout(mins * 60 * 1000, reason);
 
-      saveConfig();
-      setupSessions.delete(interaction.user.id);
-
-      await interaction.update({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("✅ FilterProtect Setup Complete")
-            .setDescription(
-              `Harshness: **${guildConfig.harshness}**\n` +
-                `Admin role: ${
-                  guildConfig.adminRoleId ? `<@&${guildConfig.adminRoleId}>` : "Not created"
-                }\n` +
-                `Logs channel: ${
-                  guildConfig.logsChannelId ? `<#${guildConfig.logsChannelId}>` : "Not created"
-                }\n\n` +
-                "FilterProtect is now active and using **Gemini** to scan every message, link, image, and attachment."
-            )
-            .setColor("#57F287")
-        ],
-        components: []
-      });
-
-      await logEvent(
-        guild,
-        guildConfig,
-        "✅ FilterProtect Setup Complete",
-        `Setup finished by ${interaction.user.tag}.`
-      );
-
-      return;
-    }
-
-    // re-render setup step
-    const step = session.step;
-    let embed;
-    let components = [];
-
-    if (step === 1) {
-      embed = new EmbedBuilder()
-        .setTitle("🛡️ FilterProtect Setup — Step 1/3")
-        .setDescription(
-          "Welcome to **FilterProtect**.\n\n" +
-            "This wizard will:\n" +
-            "• Create a `FilterProtect Admin` role\n" +
-            "• Create a `filterprotect-logs` channel\n" +
-            "• Let you choose **harshness**\n\n" +
-            "Click **Next** to continue."
-        )
-        .setColor("#5865F2");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_next")
-            .setLabel("Next ➜")
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    } else if (step === 2) {
-      embed = new EmbedBuilder()
-        .setTitle("🛡️ FilterProtect Setup — Step 2/3 (Harshness)")
-        .setDescription(
-          "Choose a **harshness level**:\n\n" +
-            "1 = Soft (delete + warn)\n" +
-            "2 = Medium (delete + warn + strike)\n" +
-            "3 = Hard (delete + timeout)\n" +
-            "4 = Extreme (delete + timeout + auto‑kick at 3 strikes)\n\n" +
-            `Current selection: **${session.harshness}**`
-        )
-        .setColor("#FEE75C");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_1")
-            .setLabel("1")
-            .setStyle(session.harshness === 1 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_2")
-            .setLabel("2")
-            .setStyle(session.harshness === 2 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_3")
-            .setLabel("3")
-            .setStyle(session.harshness === 3 ? ButtonStyle.Success : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_harsh_4")
-            .setLabel("4")
-            .setStyle(session.harshness === 4 ? ButtonStyle.Success : ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_prev")
-            .setLabel("⬅ Previous")
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_next")
-            .setLabel("Next ➜")
-            .setStyle(ButtonStyle.Primary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    } else if (step === 3) {
-      embed = new EmbedBuilder()
-        .setTitle("🛡️ FilterProtect Setup — Step 3/3 (Roles & Logs)")
-        .setDescription(
-          "Choose what FilterProtect should create:\n\n" +
-            `Admin role: **${session.createAdmin ? "Create `FilterProtect Admin`" : "Do not create"}**\n` +
-            `Logs channel: **${
-              session.createLogs ? "Create `filterprotect-logs`" : "Do not create"
-            }**\n\n` +
-            "Click **Finish** to apply settings."
-        )
-        .setColor("#57F287");
-
-      components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_toggle_admin")
-            .setLabel(
-              session.createAdmin ? "Disable Admin Role Creation" : "Enable Admin Role Creation"
-            )
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_toggle_logs")
-            .setLabel(
-              session.createLogs ? "Disable Logs Channel Creation" : "Enable Logs Channel Creation"
-            )
-            .setStyle(ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId("fp_setup_prev")
-            .setLabel("⬅ Previous")
-            .setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_finish")
-            .setLabel("Finish ✅")
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId("fp_setup_cancel")
-            .setLabel("Cancel")
-            .setStyle(ButtonStyle.Danger)
-        )
-      ];
-    }
-
-    await interaction.update({ embeds: [embed], components });
+    return interaction.reply({ content: `Timed out ${user.tag} for ${mins} minutes.`, ephemeral: true });
   }
 });
 
-// ---------- Moderation (Gemini scans every message) ----------
-client.on("messageCreate", async message => {
-  if (!message.guild || message.author.bot) return;
+// =========================
+// AI MODERATION
+// =========================
 
-  const guildConfig = ensureGuildConfig(message.guild.id);
-  if (!guildConfig.scanningEnabled) return;
+client.on("messageCreate", async msg => {
+  if (!msg.guild || msg.author.bot) return;
 
-  const text = message.content || "";
-  const urls = [];
+  const cfg = ensureGuild(msg.guild.id);
+  if (!cfg.scanning) return;
 
-  for (const att of message.attachments.values()) {
-    if (att.url) urls.push(att.url);
-  }
+  const urls = [...msg.attachments.values()].map(a => a.url);
 
-  const linkRegex = /(https?:\/\/[^\s]+)/gi;
-  let match;
-  while ((match = linkRegex.exec(text)) !== null) {
-    urls.push(match[1]);
-  }
-
-  const result = await geminiModerate(text, urls);
+  const result = await geminiModerate(msg.content, urls);
   if (!result.unsafe) return;
 
-  if (!guildConfig.punishmentsEnabled) {
-    await logEvent(
-      message.guild,
-      guildConfig,
-      "🚨 FilterProtect Detection (No Punishment)",
-      `Gemini flagged content as unsafe.\nReason: **${result.reason}**`,
-      [
-        { name: "User", value: `${message.author.tag} (${message.author.id})`, inline: true },
-        { name: "Channel", value: `${message.channel}`, inline: true },
-        {
-          name: "Severity",
-          value: `${result.severity} (1=low, 4=extreme)`,
-          inline: true
-        },
-        {
-          name: "Categories",
-          value: result.categories.length ? result.categories.join(", ") : "[none]",
-          inline: false
-        },
-        { name: "Content", value: text || "[no text]", inline: false },
-        { name: "URLs", value: urls.join("\n") || "[none]", inline: false }
-      ]
-    );
-    return;
+  // Delete message
+  await msg.delete().catch(() => {});
+
+  // Add strike
+  if (cfg.punishments) {
+    cfg.strikes[msg.author.id] = (cfg.strikes[msg.author.id] || 0) + 1;
+    saveConfig();
   }
 
-  try {
-    await message.delete().catch(() => {});
-
-    await message.channel
-      .send({
-        content: `⚠️ ${message.author}, your message was removed: **${result.reason}**`
-      })
-      .then(m => setTimeout(() => m.delete().catch(() => {}), 7000));
-
-    const harsh = guildConfig.harshness;
-
-    if (!guildConfig.strikes[message.author.id]) guildConfig.strikes[message.author.id] = 0;
-
-    if (harsh >= 2 || result.severity >= 2) {
-      guildConfig.strikes[message.author.id]++;
-      saveConfig();
-    }
-
-    if ((harsh >= 3 || result.severity >= 3) && message.member) {
-      try {
-        await message.member.timeout(10 * 60 * 1000, "FilterProtect auto-timeout (Gemini)");
-      } catch {}
-    }
-
-    if ((harsh === 4 || result.severity === 4) && message.member) {
-      const strikes = guildConfig.strikes[message.author.id] || 0;
-      if (strikes >= 3) {
-        try {
-          await message.member.kick("FilterProtect auto-kick (3 strikes, Gemini)");
-        } catch {}
-      }
-    }
-
-    await logEvent(
-      message.guild,
-      guildConfig,
-      "🚨 FilterProtect Action (Gemini)",
-      `Gemini flagged content as unsafe.\nReason: **${result.reason}**`,
-      [
-        { name: "User", value: `${message.author.tag} (${message.author.id})`, inline: true },
-        { name: "Channel", value: `${message.channel}`, inline: true },
-        {
-          name: "Severity",
-          value: `${result.severity} (1=low, 4=extreme)`,
-          inline: true
-        },
-        {
-          name: "Categories",
-          value: result.categories.length ? result.categories.join(", ") : "[none]",
-          inline: false
-        },
-        { name: "Content", value: text || "[no text]", inline: false },
-        { name: "URLs", value: urls.join("\n") || "[none]", inline: false }
-      ]
-    );
-  } catch (e) {
-    console.error("Punish error:", e);
+  // Auto-kick
+  if (cfg.autoKick && cfg.strikes[msg.author.id] >= 3) {
+    const member = msg.guild.members.cache.get(msg.author.id);
+    await member.kick("Auto-kick: 3 strikes").catch(() => {});
   }
+
+  // Log
+  await logEvent(
+    msg.guild,
+    cfg,
+    "AI Moderation",
+    `${msg.author.tag} — ${result.reason}`
+  );
 });
 
-// ---------- Guild Join ----------
-client.on(Events.GuildCreate, async guild => {
-  ensureGuildConfig(guild.id);
-  saveConfig();
+// =========================
+// LOGIN
+// =========================
 
-  const channel = guild.systemChannel || guild.channels.cache.find(c => c.isTextBased());
-  if (!channel) return;
-
-  const embed = new EmbedBuilder()
-    .setTitle("👋 Welcome to FilterProtect (Gemini)")
-    .setDescription(
-      "Thanks for adding **FilterProtect**.\n\n" +
-        "Use `/setup` (server owner / admins) to configure harshness and logging.\n" +
-        "Use `/settings` to toggle scanning and punishments.\n" +
-        "Use `/log` to manually log and strike any user.\n" +
-        "All messages, links, images, and attachments are scanned by **Gemini**."
-    )
-    .setColor("#5865F2");
-
-  await channel.send({ embeds: [embed] });
-});
-
-// ---------- Login ----------
-console.log("Starting FilterProtect...");
-console.log("DISCORD_TOKEN present:", !!process.env.DISCORD_TOKEN);
-console.log("GEMINI_API_KEY present:", !!process.env.GEMINI_API_KEY);
 client.login(process.env.DISCORD_TOKEN);
